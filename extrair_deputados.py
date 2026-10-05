@@ -4,15 +4,21 @@
 partido, UF, CPF e cargo.
 
 Fontes (TSE):
-  - divulgacandcontas.tse.jus.br  -> lista de candidatos e ficha (CPF, nome completo)
-  - resultados.tse.jus.br         -> votação e situação de totalização
+  - resultados.tse.jus.br         -> candidatos, votação e situação de totalização
+      oficial/comum/config/ele-c.json
+      oficial/ele2026/{cd}/dados/{uf}/{uf}-c{cargo:04d}-e{cd:06d}-u.json
+  - divulgacandcontas.tse.jus.br  -> ficha do candidato (CPF)
+      divulga/rest/v1/candidatura/buscar/2026/{UF}/{eleicao}/candidato/{sqcand}
+  - opcional: CSV consulta_cand_2026 dos dados abertos do TSE (--cpf-csv), usado
+    quando o DivulgaCandContas não estiver acessível.
 
 Uso:
   python3 extrair_deputados.py                 # todas as UFs
   python3 extrair_deputados.py --ufs CE SP     # apenas algumas UFs
-  python3 extrair_deputados.py --suplentes 3 --saida deputados_2026.csv
+  python3 extrair_deputados.py --cpf-csv consulta_cand_2026_BRASIL.csv
+  python3 extrair_deputados.py --xlsx deputados_2026.xlsx   # requer openpyxl
 
-Só usa a biblioteca padrão do Python 3.8+.
+Só usa a biblioteca padrão do Python 3.8+ (openpyxl apenas para --xlsx).
 """
 import argparse
 import csv
@@ -26,25 +32,28 @@ from concurrent.futures import ThreadPoolExecutor
 ANO = 2026
 DIVULGA = "https://divulgacandcontas.tse.jus.br/divulga/rest/v1"
 RESULTADOS = "https://resultados.tse.jus.br/oficial"
-# Id da eleição geral federal 2026 no DivulgaCandContas (da URL da ficha do candidato).
+# Id da eleição geral 2026 no DivulgaCandContas (da URL da ficha do candidato).
 ELEICAO_DIVULGA_PADRAO = "20322002026"
 
 UFS = ["AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS",
        "MT", "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC",
        "SE", "SP", "TO"]
 DEP_FEDERAL, DEP_ESTADUAL, DEP_DISTRITAL = 6, 7, 8
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/129.0 Safari/537.36")
 
 
 def get_json(url, tentativas=4):
+    """JSON da URL; None em 404. Erros 403 (bloqueio) não são repetidos."""
     for i in range(tentativas):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
+            req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.loads(r.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 return None
-            if i == tentativas - 1:
+            if e.code == 403 or i == tentativas - 1:
                 raise
         except (urllib.error.URLError, TimeoutError):
             if i == tentativas - 1:
@@ -52,136 +61,197 @@ def get_json(url, tentativas=4):
         time.sleep(2 ** (i + 1))
 
 
-def eleicao_divulga(padrao):
-    """Descobre o id da eleição ordinária de 2026; cai no padrão se não achar."""
-    try:
-        dados = get_json(f"{DIVULGA}/eleicao/ordinarias") or []
-        for e in dados:
-            if int(e.get("ano", 0)) == ANO and "federal" in (e.get("nomeEleicao") or e.get("descricaoEleicao") or "").lower():
-                return str(e["id"])
-    except Exception as exc:  # noqa: BLE001
-        print(f"aviso: não consegui listar eleições ({exc}); usando {padrao}", file=sys.stderr)
-    return padrao
-
-
-def codigos_resultados():
-    """Códigos das eleições de 1º turno de 2026 no site de resultados."""
+def eleicao_resultados(cargo):
+    """Código (cd) da eleição de 1º turno de 2026 que contém o cargo."""
     cfg = get_json(f"{RESULTADOS}/comum/config/ele-c.json") or {}
-    codigos = []
     for pleito in cfg.get("pl", []):
+        if pleito.get("c") != f"ele{ANO}":
+            continue
         for e in pleito.get("e", []):
-            if str(ANO) in (e.get("nm", "") + pleito.get("dt", "")) and str(e.get("t", "1")) == "1":
-                codigos.append(str(e["cd"]))
-    return codigos
+            cargos = {c.get("cd") for a in e.get("abr", []) for c in a.get("cp", [])}
+            if str(e.get("t")) == "1" and str(cargo) in cargos:
+                return str(e["cd"])
+    raise SystemExit(f"cargo {cargo} não encontrado em ele-c.json para {ANO}")
 
 
-def votacao(uf, cargo, codigos):
-    """Retorna {sqcand: {...}} com votos e situação de totalização."""
-    for cd in codigos:
-        url = (f"{RESULTADOS}/ele{ANO}/{cd}/dados-simplificados/{uf.lower()}/"
-               f"{uf.lower()}-c{cargo:04d}-e{int(cd):06d}-r.json")
-        dados = get_json(url)
-        if dados and dados.get("cand"):
-            return {str(c.get("sqcand")): c for c in dados["cand"]}, dados.get("dt", ""), dados.get("ht", "")
-    return {}, "", ""
+def votacao(uf, cargo, cd):
+    """Arquivo de resultado do cargo na UF: candidatos agrupados por agremiação."""
+    url = (f"{RESULTADOS}/ele{ANO}/{cd}/dados/{uf.lower()}/"
+           f"{uf.lower()}-c{cargo:04d}-e{int(cd):06d}-u.json")
+    dados = get_json(url) or {}
+    carg = (dados.get("carg") or [{}])[0]
+    candidatos = []
+    for agr in carg.get("agr", []):
+        for par in agr.get("par", []):
+            for c in par.get("cand", []):
+                candidatos.append({"c": c, "par": par, "agr": agr})
+    info = {
+        "vagas": int(carg.get("nv") or 0),
+        "cargo": carg.get("nmn", ""),
+        "totalizacao_final": dados.get("tf") == "s",
+        "secoes_pct": (dados.get("s") or {}).get("pst", ""),
+        "atualizado": f"{dados.get('dt', '')} {dados.get('ht', '')}".strip(),
+    }
+    return candidatos, info
 
 
-def listar_candidatos(uf, eleicao, cargo):
-    dados = get_json(f"{DIVULGA}/candidatura/listar/{ANO}/{uf}/{eleicao}/{cargo}/candidatos") or {}
-    return dados.get("candidatos", [])
-
-
-def ficha(uf, eleicao, cand_id):
-    return get_json(f"{DIVULGA}/candidatura/buscar/{ANO}/{uf}/{eleicao}/candidato/{cand_id}") or {}
-
-
-def votos(v):
+def votos(c):
     try:
-        return int(str(v.get("vap", "0")).replace(".", ""))
+        return int(str(c.get("vap", "0")).replace(".", ""))
     except ValueError:
         return 0
 
 
-def selecionar(uf, cargo, eleicao, codigos, n_suplentes):
-    candidatos = listar_candidatos(uf, eleicao, cargo)
-    resultado, dt, ht = votacao(uf, cargo, codigos)
-    eleitos, suplentes_por_grupo = [], {}
-    for c in candidatos:
-        r = resultado.get(str(c.get("id")), {})
-        situacao = r.get("st") or c.get("descricaoTotalizacao") or ""
-        s = situacao.lower()
-        item = {"cand": c, "situacao": situacao, "votos": votos(r) if r else None,
-                "grupo": r.get("cc") or (c.get("partido") or {}).get("sigla", "")}
+def selecionar(uf, cargo, cd, n_suplentes):
+    candidatos, info = votacao(uf, cargo, cd)
+    eleitos, suplentes = [], {}
+    for it in candidatos:
+        s = (it["c"].get("st") or "").lower()
+        it["grupo"] = it["agr"].get("nm") or it["par"].get("sg", "")
         if s.startswith("eleito"):
-            eleitos.append(item)
+            eleitos.append(it)
         elif s.startswith("suplente"):
-            suplentes_por_grupo.setdefault(item["grupo"], []).append(item)
-    selecionados = [(it, "Eleito", None) for it in eleitos]
-    for grupo, lista in suplentes_por_grupo.items():
-        lista.sort(key=lambda it: -(it["votos"] or 0))
+            suplentes.setdefault(it["grupo"], []).append(it)
+    selecionados = [(it, "Eleito", None) for it in sorted(eleitos, key=lambda it: -votos(it["c"]))]
+    for grupo in sorted(suplentes):
+        lista = sorted(suplentes[grupo], key=lambda it: -votos(it["c"]))
         for pos, it in enumerate(lista[:n_suplentes], 1):
             selecionados.append((it, "Suplente", pos))
-    atualizado = f"{dt} {ht}".strip()
-    return selecionados, len(candidatos), atualizado
+    return selecionados, len(candidatos), info
+
+
+def carregar_cpf_csv(caminho):
+    """{SQ_CANDIDATO: CPF} a partir do consulta_cand_2026 (dados abertos do TSE)."""
+    cpfs = {}
+    with open(caminho, encoding="latin-1", newline="") as fh:
+        for linha in csv.DictReader(fh, delimiter=";"):
+            sq, cpf = linha.get("SQ_CANDIDATO"), linha.get("NR_CPF_CANDIDATO")
+            if sq and cpf and cpf not in ("-1", "-4"):
+                cpfs[sq.strip()] = cpf.strip().zfill(11)
+    return cpfs
+
+
+def divulga_acessivel(uf, eleicao, sqcand):
+    try:
+        get_json(f"{DIVULGA}/candidatura/buscar/{ANO}/{uf}/{eleicao}/candidato/{sqcand}", tentativas=2)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"aviso: DivulgaCandContas inacessível ({exc}); CPF só via --cpf-csv", file=sys.stderr)
+        return False
+
+
+def ficha(uf, eleicao, sqcand):
+    try:
+        return get_json(f"{DIVULGA}/candidatura/buscar/{ANO}/{uf}/{eleicao}/candidato/{sqcand}") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def formatar_cpf(cpf):
+    d = "".join(ch for ch in str(cpf or "") if ch.isdigit())
+    return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}" if len(d) == 11 else ""
+
+
+def gravar_xlsx(caminho, linhas, colunas):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+    wb = Workbook()
+    wb.remove(wb.active)
+    abas = {"Deputado Federal": "Dep. Federal", "Deputado Estadual": "Dep. Estadual",
+            "Deputado Distrital": "Dep. Distrital"}
+    for cargo, nome in abas.items():
+        ws = wb.create_sheet(nome)
+        ws.append(colunas)
+        for c in ws[1]:
+            c.font = Font(bold=True)
+        for l in linhas:
+            if l["cargo"] == cargo:
+                ws.append([l[k] for k in colunas])
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+        for i, k in enumerate(colunas, 1):
+            largura = max([len(str(k))] + [len(str(l[k])) for l in linhas if l["cargo"] == cargo])
+            ws.column_dimensions[get_column_letter(i)].width = min(largura + 2, 50)
+    wb.save(caminho)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ufs", nargs="*", default=UFS)
     ap.add_argument("--suplentes", type=int, default=3)
-    ap.add_argument("--eleicao", default=None, help="id da eleição no DivulgaCandContas")
+    ap.add_argument("--eleicao", default=ELEICAO_DIVULGA_PADRAO, help="id da eleição no DivulgaCandContas")
+    ap.add_argument("--cpf-csv", help="consulta_cand_2026 (CSV ';' latin-1) com SQ_CANDIDATO e NR_CPF_CANDIDATO")
     ap.add_argument("--saida", default=f"deputados_eleitos_suplentes_{ANO}.csv")
+    ap.add_argument("--xlsx", help="também grava um .xlsx com uma aba por cargo (requer openpyxl)")
     ap.add_argument("--threads", type=int, default=8)
     args = ap.parse_args()
 
-    eleicao = args.eleicao or eleicao_divulga(ELEICAO_DIVULGA_PADRAO)
-    codigos = codigos_resultados()
-    print(f"eleição DivulgaCandContas={eleicao}; códigos de resultados={codigos}", file=sys.stderr)
-
-    tarefas = []
+    tarefas, resumo = [], []
     for uf in [u.upper() for u in args.ufs]:
-        cargos = [DEP_FEDERAL, DEP_DISTRITAL if uf == "DF" else DEP_ESTADUAL]
-        for cargo in cargos:
-            sel, total, atualizado = selecionar(uf, cargo, eleicao, codigos, args.suplentes)
+        for cargo in [DEP_FEDERAL, DEP_DISTRITAL if uf == "DF" else DEP_ESTADUAL]:
+            cd = eleicao_resultados(cargo)
+            sel, total, info = selecionar(uf, cargo, cd, args.suplentes)
             n_el = sum(1 for _, t, _ in sel if t == "Eleito")
-            print(f"{uf} cargo {cargo}: {total} candidatos, {n_el} eleitos, "
-                  f"{len(sel) - n_el} suplentes (totalização: {atualizado or 'n/d'})", file=sys.stderr)
-            tarefas += [(uf, it, tipo, pos) for it, tipo, pos in sel]
+            resumo.append((uf, cargo, n_el, info))
+            print(f"{uf} cargo {cargo}: {total} candidatos, {n_el}/{info['vagas']} eleitos, "
+                  f"{len(sel) - n_el} suplentes (seções {info['secoes_pct']}%, "
+                  f"{'final' if info['totalizacao_final'] else 'PARCIAL'}, {info['atualizado'] or 'n/d'})",
+                  file=sys.stderr)
+            tarefas += [(uf, info["cargo"], it, tipo, pos) for it, tipo, pos in sel]
+
+    cpfs = carregar_cpf_csv(args.cpf_csv) if args.cpf_csv else {}
+    usar_divulga = bool(tarefas) and divulga_acessivel(tarefas[0][0], args.eleicao, tarefas[0][2]["c"]["sqcand"])
 
     def montar(t):
-        uf, it, tipo, pos = t
-        c = it["cand"]
-        f = ficha(uf, eleicao, c["id"])
-        partido = f.get("partido") or c.get("partido") or {}
+        uf, cargo, it, tipo, pos = t
+        c, par = it["c"], it["par"]
+        sq = str(c.get("sqcand"))
+        cpf = cpfs.get(sq, "")
+        nome = c.get("nm", "")
+        if usar_divulga and not cpf:
+            f = ficha(uf, args.eleicao, sq)
+            cpf, nome = f.get("cpf") or "", f.get("nomeCompleto") or nome
         return {
             "uf": uf,
-            "cargo": (f.get("cargo") or c.get("cargo") or {}).get("nome", ""),
+            "cargo": cargo,
             "resultado": tipo,
             "ordem_suplencia": pos or "",
-            "situacao_totalizacao": it["situacao"],
-            "nome_completo": f.get("nomeCompleto") or c.get("nomeCompleto", ""),
-            "nome_urna": f.get("nomeUrna") or c.get("nomeUrna", ""),
-            "numero": f.get("numero") or c.get("numero", ""),
-            "partido_sigla": partido.get("sigla", ""),
-            "partido_nome": partido.get("nome", ""),
-            "partido_federacao_coligacao": it["grupo"],
-            "cpf": f.get("cpf", ""),
-            "votos": it["votos"] if it["votos"] is not None else "",
-            "id_candidato_tse": c["id"],
+            "situacao_totalizacao": c.get("st", ""),
+            "nome_completo": nome,
+            "nome_urna": c.get("nmu", ""),
+            "numero": c.get("n", ""),
+            "partido_sigla": par.get("sg", ""),
+            "partido_nome": par.get("nm", ""),
+            "partido_federacao": it["grupo"],
+            "cpf": formatar_cpf(cpf),
+            "votos": votos(c),
+            "id_candidato_tse": sq,
         }
 
     with ThreadPoolExecutor(args.threads) as ex:
         linhas = list(ex.map(montar, tarefas))
 
-    ordem = {"Eleito": 0, "Suplente": 1}
-    linhas.sort(key=lambda l: (l["uf"], l["cargo"], ordem[l["resultado"]],
-                               l["partido_federacao_coligacao"], str(l["ordem_suplencia"]),
-                               -(l["votos"] or 0)))
+    colunas = list(linhas[0].keys()) if linhas else ["uf"]
     with open(args.saida, "w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(linhas[0].keys()) if linhas else ["uf"], delimiter=";")
+        w = csv.DictWriter(fh, fieldnames=colunas, delimiter=";")
         w.writeheader()
         w.writerows(linhas)
     print(f"{len(linhas)} linhas gravadas em {args.saida}", file=sys.stderr)
+    if args.xlsx:
+        gravar_xlsx(args.xlsx, linhas, colunas)
+        print(f"planilha gravada em {args.xlsx}", file=sys.stderr)
+
+    fed = sum(n for _, cg, n, _ in resumo if cg == DEP_FEDERAL)
+    est = sum(n for _, cg, n, _ in resumo if cg != DEP_FEDERAL)
+    print(f"eleitos: {fed} federais, {est} estaduais/distritais", file=sys.stderr)
+    for uf, cg, n, info in resumo:
+        if not info["totalizacao_final"] or n != info["vagas"]:
+            print(f"ATENÇÃO {uf} cargo {cg}: {n}/{info['vagas']} eleitos, totalização "
+                  f"{'final' if info['totalizacao_final'] else 'parcial'}", file=sys.stderr)
+    sem_cpf = sum(1 for l in linhas if not l["cpf"])
+    if sem_cpf:
+        print(f"ATENÇÃO: {sem_cpf} linhas sem CPF", file=sys.stderr)
 
 
 if __name__ == "__main__":

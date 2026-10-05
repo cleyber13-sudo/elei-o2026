@@ -12,7 +12,15 @@ nome de urna, número, partido, federação/coligação, CPF, votos e id TSE.
 ```bash
 python3 extrair_deputados.py                      # todas as UFs
 python3 extrair_deputados.py --ufs CE --saida ce.csv
+python3 extrair_deputados.py --xlsx deputados_2026.xlsx    # uma aba por cargo (requer openpyxl)
+python3 extrair_deputados.py --cpf-csv consulta_cand_2026_BRASIL.csv
 ```
+
+Nome, partido, federação, votos e situação vêm de `resultados.tse.jus.br`
+(eleição estadual 2026, arquivos `dados/<uf>/<uf>-c000N-e006259-u.json`).
+O CPF vem da ficha do DivulgaCandContas; se esse site estiver bloqueado, passe o
+CSV `consulta_cand_2026` dos dados abertos do TSE em `--cpf-csv`
+(colunas `SQ_CANDIDATO` e `NR_CPF_CANDIDATO`).
 
 Requer Python 3.8+ e acesso a `divulgacandcontas.tse.jus.br` e
 `resultados.tse.jus.br`. Rode depois que o TSE concluir a totalização; antes
